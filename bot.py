@@ -11,6 +11,7 @@ import base64
 import io
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import datetime
@@ -59,8 +60,9 @@ def smart_label(email: str) -> str:
 
 def slug_base(email: str, now: datetime) -> str:
     local = email.split("@", 1)[0].lower()
-    local = re.sub(r"[^a-z0-9]+", "-", local).strip("-")[:22] or "folder"
-    return f"{local}-{now.strftime('%d%b-%H%M').lower()}"
+    local = re.sub(r"[^a-z0-9]+", "-", local).strip("-")[:18] or "folder"
+    rand_entropy = secrets.token_hex(4)  # 32-bit cryptographic entropy prevents IDOR/enumeration
+    return f"{local}-{now.strftime('%d%b-%H%M').lower()}-{rand_entropy}"
 
 
 def extract_email(text: str) -> Optional[str]:
