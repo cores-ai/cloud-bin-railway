@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS submissions (
     folder_slug TEXT NOT NULL UNIQUE,
     date_ist TEXT NOT NULL,
     time_ist TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    author TEXT DEFAULT 'A',
+    sale_status TEXT DEFAULT 'unsold',
+    work_status TEXT DEFAULT 'pending'
 );
 CREATE TABLE IF NOT EXISTS submission_photos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,6 +40,10 @@ CREATE TABLE IF NOT EXISTS intake_drafts (
     photo1_mime TEXT,
     photo2_b64 TEXT,
     photo2_mime TEXT,
+    author TEXT,
+    sale_status TEXT,
+    work_status TEXT,
+    step TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS authorized_users (
@@ -97,6 +104,29 @@ class D1:
             sql = statement.strip()
             if sql:
                 self.run(sql)
+
+        # Ensure any new migration columns exist safely
+        for col, col_type, def_val in [
+            ("author", "TEXT", "'A'"),
+            ("sale_status", "TEXT", "'unsold'"),
+            ("work_status", "TEXT", "'pending'"),
+        ]:
+            try:
+                self.run(f"ALTER TABLE submissions ADD COLUMN {col} {col_type} DEFAULT {def_val}")
+            except Exception:
+                pass
+
+        for col, col_type in [
+            ("author", "TEXT"),
+            ("sale_status", "TEXT"),
+            ("work_status", "TEXT"),
+            ("step", "TEXT"),
+        ]:
+            try:
+                self.run(f"ALTER TABLE intake_drafts ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass
+
         self.refresh_auth_cache()
 
     def refresh_auth_cache(self) -> None:

@@ -3,7 +3,8 @@ Railway Telegram Intake Bot.
 
 Automated 2-photo & 1-email collector for Cloudflare D1 (doc-dustbin).
 Detects email (Gmail or custom domain with @), receives 2 photos in any order,
-timestamps with Indian Standard Time (IST), bundles them into a folder,
+prompts step-by-step inline keyboards for Uploader (A / P / AP), Sale Status (Unsold / Sold),
+and Processing Status (Pending / Complete), timestamps with Indian Standard Time (IST),
 and uploads everything directly to Cloudflare D1.
 """
 
@@ -117,10 +118,12 @@ class Telegram:
             raise RuntimeError(data.get("description") or f"Telegram {method} failed")
         return data
 
-    def send(self, chat_id: int, text: str, parse_mode: Optional[str] = "HTML") -> None:
-        payload = {"chat_id": chat_id, "text": text}
+    def send(self, chat_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         self.call("sendMessage", payload, timeout=20)
 
     def file_bytes(self, file_id: str) -> bytes:
@@ -133,7 +136,7 @@ class Telegram:
     def updates(self) -> List[Dict[str, Any]]:
         data = self.call(
             "getUpdates",
-            {"offset": self.offset, "timeout": 25, "allowed_updates": ["message"]},
+            {"offset": self.offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]},
             timeout=40,
         )
         batch = data.get("result") or []
@@ -149,6 +152,10 @@ def blank_draft() -> Dict[str, Any]:
         "photo1_mime": None,
         "photo2_b64": None,
         "photo2_mime": None,
+        "author": None,
+        "sale_status": None,
+        "work_status": None,
+        "step": None,
     }
 
 
@@ -165,14 +172,19 @@ def save_draft(d1: D1, owner_id: int, draft: Dict[str, Any], now: datetime) -> N
     d1.run(
         """
         INSERT INTO intake_drafts (
-            owner_id, email, photo1_b64, photo1_mime, photo2_b64, photo2_mime, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            owner_id, email, photo1_b64, photo1_mime, photo2_b64, photo2_mime,
+            author, sale_status, work_status, step, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(owner_id) DO UPDATE SET
             email = excluded.email,
             photo1_b64 = excluded.photo1_b64,
             photo1_mime = excluded.photo1_mime,
             photo2_b64 = excluded.photo2_b64,
             photo2_mime = excluded.photo2_mime,
+            author = excluded.author,
+            sale_status = excluded.sale_status,
+            work_status = excluded.work_status,
+            step = excluded.step,
             updated_at = excluded.updated_at
         """,
         [
@@ -182,6 +194,10 @@ def save_draft(d1: D1, owner_id: int, draft: Dict[str, Any], now: datetime) -> N
             draft.get("photo1_mime"),
             draft.get("photo2_b64"),
             draft.get("photo2_mime"),
+            draft.get("author"),
+            draft.get("sale_status"),
+            draft.get("work_status"),
+            draft.get("step"),
             now.isoformat(),
         ],
     )
@@ -210,14 +226,18 @@ def commit_submission(d1: D1, owner_id: int, draft: Dict[str, Any], now: datetim
     slug = unique_slug(d1, slug_base(email, now))
     date_ist = now.strftime("%d %b %Y")
     time_ist = now.strftime("%I:%M %p").lstrip("0")
+    author = draft.get("author") or "A"
+    sale_status = draft.get("sale_status") or "unsold"
+    work_status = draft.get("work_status") or "pending"
 
     inserted = d1.run(
         """
         INSERT INTO submissions (
-            owner_id, email, folder_label, folder_slug, date_ist, time_ist, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            owner_id, email, folder_label, folder_slug, date_ist, time_ist, created_at,
+            author, sale_status, work_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [owner_id, email, label, slug, date_ist, time_ist, now.isoformat()],
+        [owner_id, email, label, slug, date_ist, time_ist, now.isoformat(), author, sale_status, work_status],
     )
     submission_id = (inserted.get("meta") or {}).get("last_row_id")
     if not submission_id:
@@ -242,6 +262,9 @@ def commit_submission(d1: D1, owner_id: int, draft: Dict[str, Any], now: datetim
         "slug": slug,
         "date_ist": date_ist,
         "time_ist": time_ist,
+        "author": author,
+        "sale_status": sale_status,
+        "work_status": work_status,
     }
 
 
@@ -290,7 +313,7 @@ def get_status_message(draft: Dict[str, Any], action_taken: str = "") -> str:
     return "\n\n".join(parts)
 
 
-def handle(api: Telegram, d1: D1, master_owners: set, message: Dict[str, Any], passcode: str) -> None:
+def handle_message(api: Telegram, d1: D1, master_owners: set, message: Dict[str, Any], passcode: str) -> None:
     user = message.get("from") or {}
     chat = message.get("chat") or {}
     user_id = user.get("id")
@@ -380,15 +403,24 @@ def handle(api: Telegram, d1: D1, master_owners: set, message: Dict[str, Any], p
         if email or file_id:
             # Check if both photos and email are ready
             if is_ready(draft):
-                saved = commit_submission(d1, user_id, draft, now)
+                # Start step-by-step inline chooser flow (Step 1: Uploader Name)
+                draft["step"] = "pick_author"
+                save_draft(d1, user_id, draft, now)
+
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🅰️ A", "callback_data": "choose_author:A"},
+                            {"text": "🅿️ P", "callback_data": "choose_author:P"},
+                            {"text": "🆎 AP", "callback_data": "choose_author:AP"},
+                        ]
+                    ]
+                }
                 api.send(
                     chat_id,
-                    f"🎉 <b>Folder Created Successfully!</b>\n\n"
-                    f"📁 <b>Folder:</b> {saved['label']}\n"
-                    f"📧 <b>Email:</b> <code>{saved['email']}</code>\n"
-                    f"🕒 <b>Saved at:</b> {saved['date_ist']} · {saved['time_ist']} IST\n"
-                    f"🖼️ <b>Files:</b> 2 photos securely stored in Cloudflare D1\n\n"
-                    f"🌐 <i>Viewable instantly on your Vercel Dashboard!</i>"
+                    "📥 <b>Photos & Email Received!</b>\n\n"
+                    "<b>Step 1 of 3:</b> Who is uploading this document?",
+                    reply_markup=keyboard,
                 )
                 return
 
@@ -402,6 +434,134 @@ def handle(api: Telegram, d1: D1, master_owners: set, message: Dict[str, Any], p
             chat_id,
             "⚠️ <b>Notice:</b> Please send an <b>email</b> (must contain <code>@</code>) or a <b>photo</b> to proceed."
         )
+
+
+def handle_callback(api: Telegram, d1: D1, master_owners: set, query: Dict[str, Any]) -> None:
+    query_id = query.get("id")
+    user = query.get("from") or {}
+    user_id = user.get("id")
+    message = query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    data = query.get("data") or ""
+
+    if not query_id:
+        return
+
+    # Acknowledge callback immediately to eliminate client loading spinners
+    try:
+        api.call("answerCallbackQuery", {"callback_query_id": query_id})
+    except Exception:
+        pass
+
+    # Verify authorization
+    if not (user_id in master_owners or d1.is_user_authorized(user_id)):
+        api.send(chat_id, "⛔ <b>Unauthorized:</b> Please enter the passcode first.")
+        return
+
+    with DRAFT_LOCK:
+        draft = load_draft(d1, user_id)
+        if not is_ready(draft):
+            api.send(chat_id, "⚠️ <i>Draft missing or expired. Please send photos and email again.</i>")
+            return
+
+        now = datetime.now(IST)
+
+        # Step 1: Selected Author (A, P, AP)
+        if data.startswith("choose_author:"):
+            chosen_author = data.split(":", 1)[1]
+            if chosen_author not in ("A", "P", "AP"):
+                chosen_author = "A"
+            draft["author"] = chosen_author
+            draft["step"] = "pick_sale"
+            save_draft(d1, user_id, draft, now)
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🏷️ Unsold", "callback_data": "choose_sale:unsold"},
+                        {"text": "💰 Sold", "callback_data": "choose_sale:sold"},
+                    ]
+                ]
+            }
+            api.call(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": (
+                        f"👤 Uploader: <b>{chosen_author}</b>\n\n"
+                        "<b>Step 2 of 3:</b> Select Sale Status:"
+                    ),
+                    "parse_mode": "HTML",
+                    "reply_markup": keyboard,
+                },
+            )
+            return
+
+        # Step 2: Selected Sale Status (unsold, sold)
+        if data.startswith("choose_sale:"):
+            chosen_sale = data.split(":", 1)[1]
+            if chosen_sale not in ("unsold", "sold"):
+                chosen_sale = "unsold"
+            draft["sale_status"] = chosen_sale
+            draft["step"] = "pick_work"
+            save_draft(d1, user_id, draft, now)
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "⏳ Pending", "callback_data": "choose_work:pending"},
+                        {"text": "✅ Complete", "callback_data": "choose_work:complete"},
+                    ]
+                ]
+            }
+            author_val = draft.get("author") or "A"
+            api.call(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": (
+                        f"👤 Uploader: <b>{author_val}</b>\n"
+                        f"🏷️ Sale Status: <b>{chosen_sale.upper()}</b>\n\n"
+                        "<b>Step 3 of 3:</b> Select Processing Status:"
+                    ),
+                    "parse_mode": "HTML",
+                    "reply_markup": keyboard,
+                },
+            )
+            return
+
+        # Step 3: Selected Processing Status (pending, complete) -> Commit to D1!
+        if data.startswith("choose_work:"):
+            chosen_work = data.split(":", 1)[1]
+            if chosen_work not in ("pending", "complete"):
+                chosen_work = "pending"
+            draft["work_status"] = chosen_work
+
+            saved = commit_submission(d1, user_id, draft, now)
+            api.call(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": (
+                        f"🎉 <b>Folder Created Successfully!</b>\n\n"
+                        f"📁 <b>Folder:</b> {saved['label']}\n"
+                        f"📧 <b>Email:</b> <code>{saved['email']}</code>\n"
+                        f"👤 <b>Uploader:</b> {saved['author']}\n"
+                        f"🏷️ <b>Sale:</b> {saved['sale_status'].upper()}\n"
+                        f"⚡ <b>Status:</b> {saved['work_status'].upper()}\n"
+                        f"🕒 <b>Saved at:</b> {saved['date_ist']} · {saved['time_ist']} IST\n"
+                        f"🖼️ <b>Files:</b> 2 photos securely stored in Cloudflare D1\n\n"
+                        f"🌐 <i>Viewable instantly on your Vercel Dashboard!</i>"
+                    ),
+                    "parse_mode": "HTML",
+                },
+            )
+            return
 
 
 def serve_health() -> None:
@@ -459,23 +619,19 @@ def main() -> None:
     print(f"[+] Master Owners: {', '.join(str(item) for item in sorted(owners))}")
     print(f"[+] Security Passcode Configured: {'*' * len(passcode)}")
     print("[+] Cloudflare D1 Database Initialized: 'doc-dustbin'")
-    print("[*] Intake Loop Active: Listening for 2 photos and 1 email...")
+    print("[*] Intake Loop Active: Listening for photos, email, and inline selections...")
     print("=" * 60)
 
     while True:
         try:
             for update in api.updates():
-                message = update.get("message") or {}
                 try:
-                    handle(api, d1, owners, message, passcode)
+                    if "message" in update:
+                        handle_message(api, d1, owners, update["message"], passcode)
+                    elif "callback_query" in update:
+                        handle_callback(api, d1, owners, update["callback_query"])
                 except Exception as exc:
-                    chat_id = (message.get("chat") or {}).get("id")
-                    print(f"[-] Message processing error: {exc}")
-                    if chat_id is not None:
-                        try:
-                            api.send(chat_id, "⚠️ <i>Could not process that file. Please send the photo or email again.</i>")
-                        except Exception as send_exc:
-                            print(f"[-] Error sending failure alert: {send_exc}")
+                    print(f"[-] Update handling error: {exc}")
         except KeyboardInterrupt:
             print("\n[*] Bot stopped by user.")
             return
