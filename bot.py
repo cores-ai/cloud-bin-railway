@@ -288,32 +288,62 @@ def get_status_message(draft: Dict[str, Any], action_taken: str = "") -> str:
     return "\n\n".join(parts)
 
 
-def handle(api: Telegram, d1: D1, owners: set, message: Dict[str, Any]) -> None:
+def handle(api: Telegram, d1: D1, master_owners: set, message: Dict[str, Any], passcode: str) -> None:
     user = message.get("from") or {}
     chat = message.get("chat") or {}
     user_id = user.get("id")
     chat_id = chat.get("id")
-    if chat_id is None or user.get("is_bot"):
-        return
-
-    # Check ownership
-    if user_id not in owners:
-        api.send(chat_id, "⛔ <b>Access Restricted:</b> This bot is configured for authorized owners only.")
+    if chat_id is None or user.get("is_bot") or user_id is None:
         return
 
     text = (message.get("text") or "").strip()
     caption = (message.get("caption") or "").strip()
+    username = user.get("username")
+    first_name = user.get("first_name")
+
+    # Check whether user is an authorized owner (via master list or Cloudflare D1 record)
+    is_authed = (user_id in master_owners) or d1.is_user_authorized(user_id)
+
+    if not is_authed:
+        # Not authorized yet: inspect message for passcode
+        cleaned = text.replace(" ", "")
+        if cleaned and cleaned == passcode:
+            d1.authorize_user(user_id, username, first_name)
+            api.send(
+                chat_id,
+                "🔓 <b>Access Granted!</b> Account successfully authorized with owner rights.\n"
+                "Saved permanently in Cloudflare D1. You won't be asked for passcode again!\n\n"
+                "👋 <b>Auto! Folder Intake.</b>\n\n"
+                "1️⃣ <b>Email address</b> (Gmail or custom domain with @)\n"
+                "2️⃣ <b>2 Photos</b> (upload or forward)"
+            )
+            return
+
+        if cleaned.isdigit() and len(cleaned) == 4:
+            api.send(
+                chat_id,
+                "⛔ <b>Access Denied:</b> Incorrect 4-digit passcode.\n"
+                "Please enter the valid passcode to authorize this Telegram account."
+            )
+        else:
+            api.send(
+                chat_id,
+                "🔒 <b>Security Gate:</b> Please enter the 4-digit passcode to authorize this Telegram account."
+            )
+        return
+
+    # Master owner or authorized user: ensure entry exists in D1
+    if not d1.is_user_authorized(user_id):
+        d1.authorize_user(user_id, username, first_name)
 
     # Commands & Reset helpers
     if text.lower() in ("/start", "/help", "hi", "hello"):
         api.send(
             chat_id,
-            "👋 <b>Welcome! Automated Folder Intake Active.</b>\n\n"
+            "👋 <b>Auto! Folder Intake.</b>\n\n"
             "No manual commands needed. Simply send:\n"
             "1️⃣ <b>Email address</b> (Gmail or custom domain with @)\n"
-            "2️⃣ <b>2 Photos</b> (upload or forward)\n\n"
-            "Once both photos & email are received, a timestamped folder (IST) is automatically created in D1 and visible on Vercel!\n\n"
-            "<i>Type <code>/reset</code> at any time to clear the current draft.</i>"
+            "2️⃣ <b>2 Photos</b> (upload or forward)"
         )
         return
 
@@ -400,6 +430,7 @@ def main() -> None:
     account_id = (os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip()
     api_token = (os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
     database_id = (os.environ.get("CLOUDFLARE_D1_DATABASE_ID") or "").strip()
+    passcode = (os.environ.get("APP_PASSCODE") or os.environ.get("PASSCODE") or "2026").strip()
 
     if not token:
         print("[-] TELEGRAM_BOT_TOKEN is missing in .env")
@@ -409,9 +440,6 @@ def main() -> None:
         return
 
     owners = owner_ids(os.environ.get("TELEGRAM_OWNER_IDS") or "")
-    if not owners:
-        print("[-] TELEGRAM_OWNER_IDS is empty or invalid in .env")
-        return
 
     threading.Thread(target=serve_health, daemon=True).start()
     api = Telegram(token)
@@ -419,9 +447,15 @@ def main() -> None:
     d1 = D1(account_id, api_token, database_id)
     d1.init()
 
+    # Ensure master owners from config are pre-seeded in D1
+    for o_id in owners:
+        if not d1.is_user_authorized(o_id):
+            d1.authorize_user(o_id, "master_owner", "Master Admin")
+
     print("=" * 60)
     print(f"[+] Telegram Bot Connected: @{me.get('username') or 'bot'}")
-    print(f"[+] Owners Authorized: {', '.join(str(item) for item in sorted(owners))}")
+    print(f"[+] Master Owners: {', '.join(str(item) for item in sorted(owners))}")
+    print(f"[+] Security Passcode Configured: {'*' * len(passcode)}")
     print("[+] Cloudflare D1 Database Initialized: 'doc-dustbin'")
     print("[*] Intake Loop Active: Listening for 2 photos and 1 email...")
     print("=" * 60)
@@ -431,7 +465,7 @@ def main() -> None:
             for update in api.updates():
                 message = update.get("message") or {}
                 try:
-                    handle(api, d1, owners, message)
+                    handle(api, d1, owners, message, passcode)
                 except Exception as exc:
                     chat_id = (message.get("chat") or {}).get("id")
                     print(f"[-] Message processing error: {exc}")

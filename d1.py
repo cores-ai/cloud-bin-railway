@@ -5,8 +5,12 @@ Manages database initialization and SQL queries via Cloudflare D1 REST API.
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
+
+IST = ZoneInfo("Asia/Kolkata")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS submissions (
@@ -35,6 +39,12 @@ CREATE TABLE IF NOT EXISTS intake_drafts (
     photo2_mime TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS authorized_users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 def load_env() -> None:
@@ -62,6 +72,7 @@ class D1:
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json",
         }
+        self._auth_cache: Set[int] = set()
 
     def run(self, sql: str, params: Optional[List[Any]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"sql": sql}
@@ -86,3 +97,32 @@ class D1:
             sql = statement.strip()
             if sql:
                 self.run(sql)
+        self.refresh_auth_cache()
+
+    def refresh_auth_cache(self) -> None:
+        try:
+            results = self.rows("SELECT user_id FROM authorized_users")
+            self._auth_cache = {int(r["user_id"]) for r in results if r.get("user_id") is not None}
+        except Exception as exc:
+            print(f"[!] Warning syncing auth cache from D1: {exc}")
+            self._auth_cache = set()
+
+    def is_user_authorized(self, user_id: int) -> bool:
+        if user_id in self._auth_cache:
+            return True
+        rows = self.rows("SELECT user_id FROM authorized_users WHERE user_id = ?", [user_id])
+        if rows:
+            self._auth_cache.add(user_id)
+            return True
+        return False
+
+    def authorize_user(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> None:
+        now_str = datetime.now(IST).isoformat()
+        self.run(
+            """
+            INSERT OR REPLACE INTO authorized_users (user_id, username, first_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [user_id, username or "", first_name or "", now_str],
+        )
+        self._auth_cache.add(user_id)
